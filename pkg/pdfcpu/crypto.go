@@ -1812,7 +1812,14 @@ func encryptStringLiteral(sl types.StringLiteral, objNr, genNr int, key []byte, 
 	return &sl, nil
 }
 
-func decryptStringLiteral(sl types.StringLiteral, objNr, genNr int, key []byte, needAES bool, r int) (*types.StringLiteral, error) {
+func repairablePlaintextString(needAES, relaxed bool, err error) bool {
+	if !needAES || !relaxed {
+		return false
+	}
+	return errors.Is(err, errAESCiphertextTooShort) || errors.Is(err, errAESCiphertextUnaligned)
+}
+
+func decryptStringLiteral(sl types.StringLiteral, objNr, genNr int, key []byte, needAES bool, r int, relaxed bool) (*types.StringLiteral, error) {
 	if sl.Value() == "" {
 		return &sl, nil
 	}
@@ -1823,6 +1830,10 @@ func decryptStringLiteral(sl types.StringLiteral, objNr, genNr int, key []byte, 
 
 	bb, err = decryptBytes(bb, objNr, genNr, key, needAES, r)
 	if err != nil {
+		if repairablePlaintextString(needAES, relaxed, err) {
+			model.ShowRepaired(fmt.Sprintf("plaintext string obj#%d", objNr))
+			return &sl, nil
+		}
 		return nil, err
 	}
 
@@ -1852,7 +1863,7 @@ func encryptHexLiteral(hl types.HexLiteral, objNr, genNr int, key []byte, needAE
 	return &hl, nil
 }
 
-func decryptHexLiteral(hl types.HexLiteral, objNr, genNr int, key []byte, needAES bool, r int) (*types.HexLiteral, error) {
+func decryptHexLiteral(hl types.HexLiteral, objNr, genNr int, key []byte, needAES bool, r int, relaxed bool) (*types.HexLiteral, error) {
 	if hl.Value() == "" {
 		return &hl, nil
 	}
@@ -1863,6 +1874,10 @@ func decryptHexLiteral(hl types.HexLiteral, objNr, genNr int, key []byte, needAE
 
 	bb, err = decryptBytes(bb, objNr, genNr, key, needAES, r)
 	if err != nil {
+		if repairablePlaintextString(needAES, relaxed, err) {
+			model.ShowRepaired(fmt.Sprintf("plaintext hex string obj#%d", objNr))
+			return &hl, nil
+		}
 		return nil, err
 	}
 
@@ -1928,7 +1943,7 @@ func encryptDeepObject(c context.Context, objIn types.Object, objNr, genNr int, 
 	return nil, contextutil.Check(c)
 }
 
-func decryptDict(c context.Context, d types.Dict, objNr, genNr int, key []byte, needAES bool, r int) error {
+func decryptDict(c context.Context, d types.Dict, objNr, genNr int, key []byte, needAES bool, r int, relaxed bool) error {
 	if err := contextutil.Check(c); err != nil {
 		return err
 	}
@@ -1949,7 +1964,7 @@ func decryptDict(c context.Context, d types.Dict, objNr, genNr int, key []byte, 
 		if isSig && k == "Contents" {
 			continue
 		}
-		s, err := decryptDeepObject(c, d[k], objNr, genNr, key, needAES, r)
+		s, err := decryptDeepObject(c, d[k], objNr, genNr, key, needAES, r, relaxed)
 		if err != nil {
 			return fmt.Errorf("decrypt dict entry %s: %w", k, err)
 		}
@@ -1962,7 +1977,7 @@ func decryptDict(c context.Context, d types.Dict, objNr, genNr int, key []byte, 
 
 // decryptDeepObject decrypts strings in direct object trees and supports cancellation.
 // Cancellation may leave the object tree partially decrypted.
-func decryptDeepObject(c context.Context, objIn types.Object, objNr, genNr int, key []byte, needAES bool, r int) (types.Object, error) {
+func decryptDeepObject(c context.Context, objIn types.Object, objNr, genNr int, key []byte, needAES bool, r int, relaxed bool) (types.Object, error) {
 	if err := contextutil.Check(c); err != nil {
 		return nil, err
 	}
@@ -1974,13 +1989,13 @@ func decryptDeepObject(c context.Context, objIn types.Object, objNr, genNr int, 
 	switch obj := objIn.(type) {
 
 	case types.Dict:
-		if err := decryptDict(c, obj, objNr, genNr, key, needAES, r); err != nil {
+		if err := decryptDict(c, obj, objNr, genNr, key, needAES, r, relaxed); err != nil {
 			return nil, err
 		}
 
 	case types.Array:
 		for i, v := range obj {
-			s, err := decryptDeepObject(c, v, objNr, genNr, key, needAES, r)
+			s, err := decryptDeepObject(c, v, objNr, genNr, key, needAES, r, relaxed)
 			if err != nil {
 				return nil, err
 			}
@@ -1990,14 +2005,14 @@ func decryptDeepObject(c context.Context, objIn types.Object, objNr, genNr int, 
 		}
 
 	case types.StringLiteral:
-		sl, err := decryptStringLiteral(obj, objNr, genNr, key, needAES, r)
+		sl, err := decryptStringLiteral(obj, objNr, genNr, key, needAES, r, relaxed)
 		if err != nil {
 			return nil, err
 		}
 		return *sl, contextutil.Check(c)
 
 	case types.HexLiteral:
-		hl, err := decryptHexLiteral(obj, objNr, genNr, key, needAES, r)
+		hl, err := decryptHexLiteral(obj, objNr, genNr, key, needAES, r, relaxed)
 		if err != nil {
 			return nil, err
 		}

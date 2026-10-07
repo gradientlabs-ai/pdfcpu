@@ -1571,3 +1571,40 @@ func TestParseXRefTableEntryZeroOffsetPolicy(t *testing.T) {
 		})
 	}
 }
+
+func TestParseObjectPlaintextAESStringInPageDict(t *testing.T) {
+	pageObj := "44 0 obj\n<<\n/Type /Page\n/LastModified (D\\07220241126174401Z)\n/Parent 1 0 R\n>>\nendobj\n"
+
+	newContext := func(mode int) *model.Context {
+		return &model.Context{
+			Read: &model.ReadContext{
+				RS: bytes.NewReader([]byte(pageObj)),
+			},
+			XRefTable: &model.XRefTable{
+				E:              &model.Enc{R: 4},
+				EncKey:         make([]byte, 16),
+				AES4Strings:    true,
+				ValidationMode: mode,
+			},
+		}
+	}
+
+	o, err := ParseObject(t.Context(), newContext(model.ValidationRelaxed), 0, 44, 0)
+	if err != nil {
+		t.Fatalf("relaxed: %v", err)
+	}
+	d, ok := o.(types.Dict)
+	if !ok {
+		t.Fatalf("relaxed: expected Dict, got %T", o)
+	}
+	if typ := d.Type(); typ == nil || *typ != "Page" {
+		t.Fatalf("relaxed: expected Type Page, got %v", typ)
+	}
+	if got, want := d["LastModified"], types.StringLiteral(`D\07220241126174401Z`); got != want {
+		t.Fatalf("relaxed: LastModified got %v, want %v", got, want)
+	}
+
+	if _, err := ParseObject(t.Context(), newContext(model.ValidationStrict), 0, 44, 0); !errors.Is(err, errAESCiphertextTooShort) {
+		t.Fatalf("strict: got %v, want %v", err, errAESCiphertextTooShort)
+	}
+}

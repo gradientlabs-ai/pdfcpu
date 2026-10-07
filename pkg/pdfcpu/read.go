@@ -2667,7 +2667,7 @@ func streamDictForObject(c context.Context, ctx *model.Context, d types.Dict, ob
 
 func dict(c context.Context, ctx *model.Context, d1 types.Dict, objNr, genNr, endInd, streamInd int) (d2 types.Dict, err error) {
 	if ctx.EncKey != nil {
-		if _, err := decryptDeepObject(c, d1, objNr, genNr, ctx.EncKey, ctx.AES4Strings, ctx.E.R); err != nil {
+		if _, err := decryptDeepObject(c, d1, objNr, genNr, ctx.EncKey, ctx.AES4Strings, ctx.E.R, ctx.XRefTable.ValidationMode == model.ValidationRelaxed); err != nil {
 			return nil, err
 		}
 	}
@@ -2800,7 +2800,7 @@ func resolveObject(c context.Context, ctx *model.Context, obj types.Object, offs
 
 	case types.Array:
 		if ctx.EncKey != nil {
-			if _, err := decryptDeepObject(c, o, objNr, genNr, ctx.EncKey, ctx.AES4Strings, ctx.E.R); err != nil {
+			if _, err := decryptDeepObject(c, o, objNr, genNr, ctx.EncKey, ctx.AES4Strings, ctx.E.R, ctx.XRefTable.ValidationMode == model.ValidationRelaxed); err != nil {
 				return nil, err
 			}
 		}
@@ -2808,7 +2808,7 @@ func resolveObject(c context.Context, ctx *model.Context, obj types.Object, offs
 
 	case types.StringLiteral:
 		if ctx.EncKey != nil {
-			sl, err := decryptStringLiteral(o, objNr, genNr, ctx.EncKey, ctx.AES4Strings, ctx.E.R)
+			sl, err := decryptStringLiteral(o, objNr, genNr, ctx.EncKey, ctx.AES4Strings, ctx.E.R, ctx.XRefTable.ValidationMode == model.ValidationRelaxed)
 			if err != nil {
 				return nil, err
 			}
@@ -2818,7 +2818,7 @@ func resolveObject(c context.Context, ctx *model.Context, obj types.Object, offs
 
 	case types.HexLiteral:
 		if ctx.EncKey != nil {
-			hl, err := decryptHexLiteral(o, objNr, genNr, ctx.EncKey, ctx.AES4Strings, ctx.E.R)
+			hl, err := decryptHexLiteral(o, objNr, genNr, ctx.EncKey, ctx.AES4Strings, ctx.E.R, ctx.XRefTable.ValidationMode == model.ValidationRelaxed)
 			if err != nil {
 				return nil, err
 			}

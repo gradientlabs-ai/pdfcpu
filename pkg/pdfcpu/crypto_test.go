@@ -520,6 +520,57 @@ func TestAESBytesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestDecryptStringLiteralPlaintextAESString(t *testing.T) {
+	key := make([]byte, 16)
+	plaintext := types.StringLiteral(`Adobe Illustrator 29.0 (Macintosh)`)
+
+	got, err := decryptStringLiteral(plaintext, 1, 0, key, true, 4, true)
+	if err != nil {
+		t.Fatalf("relaxed: %v", err)
+	}
+	if *got != plaintext {
+		t.Fatalf("relaxed: got %q, want %q", *got, plaintext)
+	}
+
+	if _, err := decryptStringLiteral(plaintext, 1, 0, key, true, 4, false); !errors.Is(err, errAESCiphertextUnaligned) {
+		t.Fatalf("strict: got %v, want %v", err, errAESCiphertextUnaligned)
+	}
+}
+
+func TestDecryptHexLiteralPlaintextAESString(t *testing.T) {
+	key := make([]byte, 16)
+	plaintext := types.NewHexLiteral([]byte("Identity"))
+
+	got, err := decryptHexLiteral(plaintext, 1, 0, key, true, 4, true)
+	if err != nil {
+		t.Fatalf("relaxed: %v", err)
+	}
+	if *got != plaintext {
+		t.Fatalf("relaxed: got %q, want %q", *got, plaintext)
+	}
+
+	if _, err := decryptHexLiteral(plaintext, 1, 0, key, true, 4, false); !errors.Is(err, errAESCiphertextTooShort) {
+		t.Fatalf("strict: got %v, want %v", err, errAESCiphertextTooShort)
+	}
+}
+
+func TestDecryptStringLiteralRelaxedDecryptsAESString(t *testing.T) {
+	key := make([]byte, 16)
+	want := types.StringLiteral("encrypted content")
+
+	encrypted, err := encryptStringLiteral(want, 1, 0, key, true, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decryptStringLiteral(*encrypted, 1, 0, key, true, 4, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *got != want {
+		t.Fatalf("got %q, want %q", *got, want)
+	}
+}
+
 // TestValidatePermissionsChecksEncryptMetadata verifies the encrypted permission flag matches the encryption dictionary.
 func TestValidatePermissionsChecksEncryptMetadata(t *testing.T) {
 	for _, encryptMetadata := range []bool{false, true} {
