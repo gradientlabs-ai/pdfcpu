@@ -795,3 +795,104 @@ func setStrictPDF17XRefTable(ctx *model.Context) {
 		ValidationMode: model.ValidationStrict,
 	}
 }
+
+func TestAES256PasswordPreparationAndRawCompatibility(t *testing.T) {
+	cases := []struct {
+		name   string
+		stored string
+		input  string
+	}{
+		{
+			name:   "spaces",
+			stored: "pass word",
+			input:  "pass word",
+		},
+		{
+			name:   "non ASCII space",
+			stored: "pass word",
+			input:  "pass\u00a0word",
+		},
+		{
+			name:   "mapped to nothing",
+			stored: "IX",
+			input:  "I\u00adX",
+		},
+		{
+			name:   "normalization",
+			stored: "IX",
+			input:  "\u2168",
+		},
+		{
+			name:   "raw newline",
+			stored: "pass\nword",
+			input:  "pass\nword",
+		},
+		{
+			name:   "raw unicode",
+			stored: "I\u00adX",
+			input:  "I\u00adX",
+		},
+		{
+			name:   "truncate after normalization",
+			stored: strings.Repeat("a", 127),
+			input:  strings.Repeat("\u00aa", 128),
+		},
+		{
+			name:   "truncate bytes",
+			stored: strings.Repeat("a", 126) + "\xc3",
+			input:  strings.Repeat("a", 126) + "éextra",
+		},
+	}
+	for _, revision := range []int{5, 6} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("R%d/%s", revision, tc.name), func(t *testing.T) {
+				conf := model.NewDefaultConfiguration()
+				conf.UserPW = tc.stored
+				conf.OwnerPW = tc.stored
+				ctx := &model.Context{
+					Configuration: conf,
+					XRefTable: &model.XRefTable{
+						E: &model.Enc{
+							R:  revision,
+							UE: make([]byte, 32),
+							OE: make([]byte, 32),
+						},
+					},
+				}
+				if err := calcOAndU(ctx, types.Dict{}); err != nil {
+					t.Fatal(err)
+				}
+				key := bytes.Clone(ctx.EncKey)
+				conf.UserPW = tc.input
+				conf.OwnerPW = tc.input
+				for _, validate := range []func(*model.Context) (bool, error){validateUserPassword, validateOwnerPassword} {
+					ctx.EncKey = nil
+					ok, err := validate(ctx)
+					if err != nil || !ok || !bytes.Equal(key, ctx.EncKey) {
+						t.Fatalf("password validation failed: ok=%t err=%v key matches=%t", ok, err, bytes.Equal(key, ctx.EncKey))
+					}
+				}
+				conf.UserPW = "incorrect\npassword"
+				conf.OwnerPW = "incorrect\npassword"
+				for _, validate := range []func(*model.Context) (bool, error){validateUserPassword, validateOwnerPassword} {
+					ok, err := validate(ctx)
+					if err != nil || ok {
+						t.Fatalf("wrong password: ok=%t err=%v", ok, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestAES256PasswordPreservesValidationError(t *testing.T) {
+	want := errors.New("malformed encryption")
+	calls := 0
+	_, err := validateAES256Password(nil, "I\u00adX", func(*model.Context, []byte) (bool, error) {
+		calls++
+		return false, want
+	})
+	if !errors.Is(err, want) || calls != 1 {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
