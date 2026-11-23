@@ -40,6 +40,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/pdfcpu/pdfcpu/internal/contextutil"
 	"github.com/pdfcpu/pdfcpu/pkg/log"
@@ -1849,12 +1852,102 @@ func decryptObjectStrings(c context.Context, ctx *model.Context, obj types.Objec
 	}
 
 	relaxed := ctx.XRefTable.ValidationMode == model.ValidationRelaxed
+	var rawInfoStrings map[string]types.Object
+	if relaxed && isInfoDict(ctx, objNr, genNr) {
+		rawInfoStrings = infoDictStrings(obj)
+	}
+
 	o, err := decryptDeepObject(c, obj, objNr, genNr, ctx.EncKey, ctx.AES4Strings, ctx.E.R, relaxed)
 	if o != nil || err != nil {
 		return o, err
 	}
 
+	if d, ok := obj.(types.Dict); ok {
+		keepPlaintextInfoStrings(d, rawInfoStrings, objNr)
+	}
+
 	return obj, nil
+}
+
+func isInfoDict(ctx *model.Context, objNr, genNr int) bool {
+	return ctx.Info != nil && ctx.Info.ObjectNumber.Value() == objNr && ctx.Info.GenerationNumber.Value() == genNr
+}
+
+func infoDictStrings(obj types.Object) map[string]types.Object {
+	d, ok := obj.(types.Dict)
+	if !ok {
+		return nil
+	}
+	raw := map[string]types.Object{}
+	for k, v := range d {
+		switch v.(type) {
+		case types.StringLiteral, types.HexLiteral:
+			raw[k] = v
+		}
+	}
+	return raw
+}
+
+// keepPlaintextInfoStrings restores Info dict strings that some producers write unencrypted.
+// RC4 decryption never fails, so it turns such a string into garbage; the raw value is kept
+// only when it reads as a date or text and the decrypted value does not.
+func keepPlaintextInfoStrings(d types.Dict, raw map[string]types.Object, objNr int) {
+	for k, rawValue := range raw {
+		rawBytes, ok := infoStringBytes(rawValue)
+		if !ok || !plausibleInfoString(k, rawBytes) {
+			continue
+		}
+		decryptedBytes, ok := infoStringBytes(d[k])
+		if ok && plausibleInfoString(k, decryptedBytes) {
+			continue
+		}
+		d[k] = rawValue
+		model.ShowRepaired(fmt.Sprintf("plaintext info string obj#%d", objNr))
+	}
+}
+
+func infoStringBytes(o types.Object) ([]byte, bool) {
+	switch v := o.(type) {
+	case types.StringLiteral:
+		b, err := types.Unescape(v.Value())
+		return b, err == nil
+	case types.HexLiteral:
+		b, err := v.Bytes()
+		return b, err == nil
+	}
+	return nil, false
+}
+
+func plausibleInfoString(key string, b []byte) bool {
+	if key == "CreationDate" || key == "ModDate" {
+		_, ok := types.DateTime(string(b), true)
+		return ok
+	}
+	if len(b) >= 2 && b[0] == 0xFE && b[1] == 0xFF {
+		return plausibleUTF16BE(b[2:])
+	}
+	for _, c := range b {
+		if c < 0x20 && c != '\t' && c != '\n' && c != '\r' || c == 0x7F {
+			return false
+		}
+	}
+	return true
+}
+
+func plausibleUTF16BE(b []byte) bool {
+	if len(b)%2 != 0 {
+		return false
+	}
+	u := make([]uint16, len(b)/2)
+	for i := range u {
+		u[i] = uint16(b[2*i])<<8 | uint16(b[2*i+1])
+	}
+	for _, r := range utf16.Decode(u) {
+		if r == utf8.RuneError || unicode.IsControl(r) && r != '\t' && r != '\n' && r != '\r' {
+			return false
+		}
+	}
+	return true
 }
 
 func streamCryptFilterName(ctx *model.Context, sd *types.StreamDict) (string, bool, error) {

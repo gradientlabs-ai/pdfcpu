@@ -1628,6 +1628,81 @@ func TestParseXRefTableEntryZeroOffsetPolicy(t *testing.T) {
 	}
 }
 
+func TestParseObjectPlaintextRC4StringsInInfoDict(t *testing.T) {
+	key := bytes.Repeat([]byte{3}, 16)
+	author, err := encryptStringLiteral(types.StringLiteral("Real Author"), 44, 0, key, false, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer := types.NewHexLiteral([]byte{0xFE, 0xFF, 0x00, 'p', 0x00, 'd', 0x00, 'f'})
+	infoObj := "44 0 obj\n<<\n/ModDate (D:20261123105941Z)\n/Title (Plum ISA Transfer Authority)\n" +
+		"/Producer " + producer.PDFString() + "\n/Author " + author.PDFString() + "\n>>\nendobj\n"
+
+	parse := func(t *testing.T, mode int, infoObjNr int) types.Dict {
+		t.Helper()
+		ctx := &model.Context{
+			Read: &model.ReadContext{RS: bytes.NewReader([]byte(infoObj))},
+			XRefTable: &model.XRefTable{
+				E:              &model.Enc{R: 3, V: 2},
+				EncKey:         key,
+				Info:           types.NewIndirectRef(infoObjNr, 0),
+				ValidationMode: mode,
+			},
+		}
+		o, err := ParseObject(t.Context(), ctx, 0, 44, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, ok := o.(types.Dict)
+		if !ok {
+			t.Fatalf("expected Dict, got %T", o)
+		}
+		return d
+	}
+
+	t.Run("relaxed info dict", func(t *testing.T) {
+		d := parse(t, model.ValidationRelaxed, 44)
+		for k, want := range map[string]types.Object{
+			"ModDate": types.StringLiteral("D:20261123105941Z"),
+			"Title":   types.StringLiteral("Plum ISA Transfer Authority"),
+			"Author":  types.StringLiteral("Real Author"),
+		} {
+			if got := d[k]; got != want {
+				t.Errorf("%s: got %v, want %v", k, got, want)
+			}
+		}
+		gotProducer, ok := d["Producer"].(types.HexLiteral)
+		if !ok {
+			t.Fatalf("Producer: got %T, want HexLiteral", d["Producer"])
+		}
+		gotBytes, err := gotProducer.Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantBytes, err := producer.Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotBytes, wantBytes) {
+			t.Errorf("Producer: got %v, want %v", gotProducer, producer)
+		}
+	})
+
+	t.Run("strict info dict", func(t *testing.T) {
+		d := parse(t, model.ValidationStrict, 44)
+		if got := d["ModDate"]; got == types.StringLiteral("D:20261123105941Z") {
+			t.Fatalf("strict mode kept the plaintext ModDate")
+		}
+	})
+
+	t.Run("relaxed other dict", func(t *testing.T) {
+		d := parse(t, model.ValidationRelaxed, 45)
+		if got := d["ModDate"]; got == types.StringLiteral("D:20261123105941Z") {
+			t.Fatalf("a dict other than Info kept the plaintext ModDate")
+		}
+	})
+}
+
 func TestParseObjectPlaintextAESStringInPageDict(t *testing.T) {
 	pageObj := "44 0 obj\n<<\n/Type /Page\n/LastModified (D\\07220241126174401Z)\n/Parent 1 0 R\n>>\nendobj\n"
 
