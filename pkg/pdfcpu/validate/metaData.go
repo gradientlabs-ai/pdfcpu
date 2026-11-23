@@ -28,7 +28,9 @@ import (
 )
 
 func validateMetadataStream(xRefTable *model.XRefTable, d types.Dict, ownerObjNr int, required bool, sinceVersion model.Version) (sd *types.StreamDict, err error) {
-	if xRefTable.ValidationMode == model.ValidationRelaxed {
+	// see 14.3.2
+	relaxed := xRefTable.ValidationMode == model.ValidationRelaxed
+	if relaxed {
 		sinceVersion = model.V10
 	}
 
@@ -50,17 +52,17 @@ func validateMetadataStream(xRefTable *model.XRefTable, d types.Dict, ownerObjNr
 	}
 
 	dictName := "metaDataDict"
+	entryRequired := !relaxed
 
 	if _, err = validateNameEntry(
-		xRefTable, sd.Dict, metadataObjNr, dictName, "Type", OPTIONAL, sinceVersion,
+		xRefTable, sd.Dict, metadataObjNr, dictName, "Type", entryRequired, sinceVersion,
 		func(s string) bool { return s == "Metadata" },
 	); err != nil {
 		return nil, fmt.Errorf("%s: %s.Type: %w", objectContext(dictEntryContext("dict", "Metadata", rawEntry), rawEntry), dictName, err)
 	}
 
-	relaxed := xRefTable.ValidationMode == model.ValidationRelaxed
 	subtype, err := validateNameEntry(
-		xRefTable, sd.Dict, metadataObjNr, dictName, "Subtype", OPTIONAL, sinceVersion,
+		xRefTable, sd.Dict, metadataObjNr, dictName, "Subtype", entryRequired, sinceVersion,
 		func(s string) bool { return s == "XML" || relaxed && s == "XMP" },
 	)
 	if err != nil {
@@ -85,6 +87,7 @@ func validateMetadata(xRefTable *model.XRefTable, d types.Dict, required bool, s
 }
 
 func catalogMetaData(xRefTable *model.XRefTable, rootDict types.Dict, required bool, sinceVersion model.Version) (xmpMeta *model.XMPMeta, err error) {
+	// see 14.3.2
 	rootObjNr := validationRootObjectNumber(xRefTable)
 	metadataObjNr := validationEntryObjectNumber(rootObjNr, rootDict, "Metadata")
 	defer func() {
@@ -104,7 +107,7 @@ func catalogMetaData(xRefTable *model.XRefTable, rootDict types.Dict, required b
 	// }
 
 	// Decode streamDict for supported filters only.
-	err = sd.Decode()
+	err = xRefTable.DecodeStream(sd)
 	if err == filter.ErrUnsupportedFilter {
 		return nil, nil
 	}

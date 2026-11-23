@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/pdfcpu/pdfcpu/internal/contextutil"
+	"github.com/pdfcpu/pdfcpu/internal/streamlimit"
 	"github.com/pdfcpu/pdfcpu/pkg/filter"
 	"github.com/pdfcpu/pdfcpu/pkg/font"
 	"github.com/pdfcpu/pdfcpu/pkg/log"
@@ -111,6 +112,10 @@ type AnnotMap map[int]AnnotationRenderer
 type Annot struct {
 	IndRefs *[]types.IndirectRef
 	Map     AnnotMap
+}
+
+type decodedStreamBudget struct {
+	used int64
 }
 
 // PgAnnots represents a map of page annotations by type.
@@ -202,8 +207,9 @@ type XRefTable struct {
 	AppendOnly     bool
 
 	// Fonts
-	UsedGIDs  map[string]map[uint16]bool
-	FillFonts map[string]types.IndirectRef
+	UsedGIDs            map[string]map[uint16]bool
+	FillFonts           map[string]types.IndirectRef
+	decodedStreamBudget decodedStreamBudget
 }
 
 // NewXRefTable creates a new XRefTable.
@@ -238,11 +244,10 @@ func (xRefTable *XRefTable) FontRepository() *font.Repository {
 	return font.RepositoryForDir(dir)
 }
 
-// Version returns the PDF version of the PDF writer that created this file.
-// Before V1.4 this is the header version.
-// Since V1.4 the catalog may contain a Version entry which takes precedence over the header version.
+// Version returns the effective PDF version.
+// A catalog Version entry takes precedence only when it is later than the header version (7.7.2).
 func (xRefTable *XRefTable) Version() Version {
-	if xRefTable.RootVersion != nil {
+	if xRefTable.RootVersion != nil && (xRefTable.HeaderVersion == nil || *xRefTable.RootVersion > *xRefTable.HeaderVersion) {
 		return *xRefTable.RootVersion
 	}
 
@@ -302,10 +307,13 @@ func (xRefTable *XRefTable) IsMerging() bool {
 	return cmd == MERGECREATE || cmd == MERGEAPPEND
 }
 
-// EnsureVersionForWriting sets the version to the highest supported PDF Version 1.7.
+// EnsureVersionForWriting raises the effective version to at least PDF 1.7.
 // This is necessary to allow validation after adding features not supported
 // by the original version of a document as during watermarking.
 func (xRefTable *XRefTable) EnsureVersionForWriting() {
+	if (xRefTable.HeaderVersion != nil || xRefTable.RootVersion != nil) && xRefTable.Version() >= V17 {
+		return
+	}
 	v := V17
 	xRefTable.RootVersion = &v
 }
@@ -1391,10 +1399,13 @@ func objStr(entry *XRefTableEntry, objNr int) string {
 	return fmt.Sprintf("%5d:   offset=nil generation=%d %s \n%s\n", objNr, *entry.Generation, typeStr, entry.Object)
 }
 
-func dumpDecodedStream(c context.Context, sd types.StreamDict, objNr, mode int) (string, error) {
-	err := sd.Decode()
+func (xRefTable *XRefTable) dumpDecodedStream(c context.Context, sd types.StreamDict, objNr, mode int) (string, error) {
+	err := xRefTable.DecodeStream(&sd)
 	if ctxErr := c.Err(); ctxErr != nil {
 		return "", ctxErr
+	}
+	if errors.Is(err, filter.ErrDecodeLimitExceeded) {
+		return "", fmt.Errorf("dump object %d: decode stream: %w", objNr, err)
 	}
 	if err == filter.ErrUnsupportedFilter {
 		return "stream filter unsupported!", nil
@@ -1447,7 +1458,7 @@ func (xRefTable *XRefTable) DumpObject(c context.Context, objNr, mode int) error
 
 	if mode > 0 {
 		if sd, ok := entry.Object.(types.StreamDict); ok {
-			s, err := dumpDecodedStream(c, sd, objNr, mode)
+			s, err := xRefTable.dumpDecodedStream(c, sd, objNr, mode)
 			if err != nil {
 				return err
 			}
@@ -1627,7 +1638,8 @@ func (xRefTable *XRefTable) bindNameTreeNodeDict(name string, n *Node, root bool
 
 func bindNameTreeNodeLimits(dict types.Dict, n *Node, root bool) {
 	if !root {
-		dict.Update("Limits", types.NewHexLiteralArray(n.Kmin, n.Kmax))
+		lo, hi := n.rawLimits()
+		dict.Update("Limits", types.NewHexLiteralArray(lo, hi))
 		return
 	}
 	dict.Delete("Limits")
@@ -1636,7 +1648,7 @@ func bindNameTreeNodeLimits(dict types.Dict, n *Node, root bool) {
 func bindNameTreeLeafNode(dict types.Dict, n *Node) {
 	a := types.Array{}
 	for _, e := range n.Names {
-		a = append(a, types.NewHexLiteral([]byte(e.k)))
+		a = append(a, types.NewHexLiteral([]byte(e.key())))
 		a = append(a, e.v)
 	}
 	dict.Update("Names", a)
@@ -2049,9 +2061,12 @@ func (xRefTable *XRefTable) consolidateResources(obj types.Object, pAttrs *Inher
 			if err != nil {
 				return fmt.Errorf("resource %s: %w", k, err)
 			}
-			if o != nil {
-				pAttrs.Resources[k] = o.Clone()
+			if o == nil {
+				// A missing reference is null, equivalent to an omitted entry (PDF 2.0 7.3.9).
+				delete(pAttrs.Resources, k)
+				continue
 			}
+			pAttrs.Resources[k] = o.Clone()
 		}
 		if log.WriteEnabled() {
 			log.Write.Printf("pA:\n%s\n", pAttrs.Resources)
@@ -2157,8 +2172,63 @@ func (xRefTable *XRefTable) checkInheritedPageAttrs(pageDict types.Dict, pAttrs 
 	return xRefTable.consolidateResources(obj, pAttrs)
 }
 
+func decodedStreamBufferLimit(conf *Configuration) int64 {
+	return streamlimit.DecodeAllowance(conf.DecodeLimit())
+}
+
+func decodedContentAliasesRaw(sd *types.StreamDict) bool {
+	return len(sd.Content) > 0 && len(sd.Raw) > 0 && &sd.Content[0] == &sd.Raw[0]
+}
+
+func decodeBufferBudgetError(limit int64) error {
+	return fmt.Errorf("stream decoding exceeded %d-byte cumulative budget: %w", limit, filter.ErrDecodeLimitExceeded)
+}
+
+// DecodeStream decodes sd using the configured per-stream and cumulative decoded-byte limits.
+// A nil table or missing configuration selects the default per-stream limit without cumulative accounting.
+func (xRefTable *XRefTable) DecodeStream(sd *types.StreamDict) error {
+	var conf *Configuration
+	if xRefTable != nil {
+		conf = xRefTable.Conf
+	}
+	decodeLimit := conf.DecodeLimit()
+	if xRefTable == nil || sd.Content != nil {
+		return sd.DecodeWithLimit(decodeLimit)
+	}
+
+	bufferLimit := decodedStreamBufferLimit(conf)
+	if bufferLimit < 0 {
+		return sd.DecodeWithLimit(decodeLimit)
+	}
+
+	remaining := bufferLimit - xRefTable.decodedStreamBudget.used
+	aggregateLimited := decodeLimit < 0 || remaining < decodeLimit
+	if aggregateLimited {
+		// DecodeWithLimit treats zero as the default limit, so use one byte when the budget is exhausted.
+		decodeLimit = max(remaining, 1)
+	}
+
+	if err := sd.DecodeWithLimit(decodeLimit); err != nil {
+		if aggregateLimited && errors.Is(err, filter.ErrDecodeLimitExceeded) {
+			return decodeBufferBudgetError(bufferLimit)
+		}
+		return err
+	}
+	if decodedContentAliasesRaw(sd) || cap(sd.Content) == 0 {
+		return nil
+	}
+
+	n := int64(cap(sd.Content))
+	if n > remaining {
+		sd.Content = nil
+		return decodeBufferBudgetError(bufferLimit)
+	}
+	xRefTable.decodedStreamBudget.used += n
+	return nil
+}
+
 func (xRefTable *XRefTable) decodeContentStream(sd *types.StreamDict, pageNr int) error {
-	err := sd.Decode()
+	err := xRefTable.DecodeStream(sd)
 	if errors.Is(err, filter.ErrUnsupportedFilter) {
 		return fmt.Errorf("page %d content decode: %w", pageNr, err)
 	}
@@ -2174,7 +2244,18 @@ func (xRefTable *XRefTable) decodeContentStream(sd *types.StreamDict, pageNr int
 	return nil
 }
 
+func (xRefTable *XRefTable) appendPageContent(bb []byte, sd *types.StreamDict, pageNr int) ([]byte, error) {
+	if err := xRefTable.decodeContentStream(sd, pageNr); err != nil {
+		return nil, err
+	}
+	if limit := xRefTable.Conf.DecodeLimit(); limit >= 0 && int64(len(sd.Content)) > limit-int64(len(bb)) {
+		return nil, fmt.Errorf("page %d combined content: %w", pageNr, filter.ErrDecodeLimitExceeded)
+	}
+	return append(bb, sd.Content...), nil
+}
+
 // PageContent returns the content in PDF syntax for page dict d.
+// The configured decode limit also bounds the combined content of a stream array.
 func (xRefTable *XRefTable) PageContent(d types.Dict, pageNr int) ([]byte, error) {
 	o, _ := d.Find("Contents")
 	if o == nil {
@@ -2192,10 +2273,10 @@ func (xRefTable *XRefTable) PageContent(d types.Dict, pageNr int) ([]byte, error
 
 	case types.StreamDict:
 		// no further processing.
-		if err := xRefTable.decodeContentStream(&o, pageNr); err != nil {
+		bb, err = xRefTable.appendPageContent(bb, &o, pageNr)
+		if err != nil {
 			return nil, err
 		}
-		bb = append(bb, o.Content...)
 
 	case types.Array:
 		// process array of content stream dicts.
@@ -2210,10 +2291,10 @@ func (xRefTable *XRefTable) PageContent(d types.Dict, pageNr int) ([]byte, error
 			if o == nil {
 				continue
 			}
-			if err := xRefTable.decodeContentStream(o, pageNr); err != nil {
+			bb, err = xRefTable.appendPageContent(bb, o, pageNr)
+			if err != nil {
 				return nil, err
 			}
-			bb = append(bb, o.Content...)
 		}
 
 	default:
@@ -2228,31 +2309,32 @@ func (xRefTable *XRefTable) PageContent(d types.Dict, pageNr int) ([]byte, error
 }
 
 func (xRefTable *XRefTable) consolidateResourceSubDict(d types.Dict, key string, prn PageResourceNames, pageNr int) error {
-	o := d[key]
-	if o == nil {
-		if prn.HasResources(key) {
-			resources := make([]string, 0, len(prn.Resources(key)))
-			for resourceName := range prn.Resources(key) {
-				resources = append(resources, resourceName)
-			}
-			sort.Strings(resources)
-			s := fmt.Sprintf(
-				"missing required %s resource dictionary (referenced resources: %s)",
-				key,
-				strings.Join(resources, ", "),
-			)
-			if xRefTable.ValidationMode == ValidationStrict {
-				return errors.New(s)
-			}
-			ShowSkipped(fmt.Sprintf("page %d: %s", pageNr, s))
-		}
-		return nil
-	}
 	if !prn.HasResources(key) {
 		d.Delete(key)
 		return nil
 	}
-	d1 := o.(types.Dict)
+	d1, err := xRefTable.DereferenceDict(d[key])
+	if err != nil {
+		return fmt.Errorf("page %d: resource %s: %w", pageNr, key, err)
+	}
+	if d1 == nil {
+		d.Delete(key)
+		resources := make([]string, 0, len(prn.Resources(key)))
+		for resourceName := range prn.Resources(key) {
+			resources = append(resources, resourceName)
+		}
+		sort.Strings(resources)
+		s := fmt.Sprintf(
+			"missing required %s resource dictionary (referenced resources: %s)",
+			key,
+			strings.Join(resources, ", "),
+		)
+		if xRefTable.ValidationMode == ValidationStrict {
+			return errors.New(s)
+		}
+		ShowSkipped(fmt.Sprintf("page %d: %s", pageNr, s))
+		return nil
+	}
 	set := types.StringSet{}
 	res := prn.Resources(key)
 	// Iterate over inherited resource sub dict and remove any entries not required.
@@ -2342,7 +2424,7 @@ func (xRefTable *XRefTable) consolidateResourcesWithContent(pageDict, resDict ty
 	}
 
 	// Calculate resources required by the content stream of this page.
-	prn, err := parseContent(string(bb))
+	prn, err := parseContent(string(bb), xRefTable.ValidationMode == ValidationRelaxed, xRefTable.PDF20())
 	if err != nil {
 		return fmt.Errorf("%s: %w", contentContext, &contentParseError{err})
 	}
@@ -3440,14 +3522,30 @@ func weaveInPage(c context.Context, ctx *Context, parent types.IndirectRef, page
 	if err != nil {
 		return nil, err
 	}
+	materializeInheritedPageAttrs(d1, inhPAttrs)
 	d1["Parent"] = parent
-	if _, found := d1["Rotate"]; !found {
-		d1["Rotate"] = types.Integer(inhPAttrs.Rotate)
-	}
-	if _, found := d1["MediaBox"]; !found {
-		d1["MediaBox"] = inhPAttrs.MediaBox.Array()
-	}
 	return indRef, nil
+}
+
+// materializeInheritedPageAttrs preserves effective attributes before a page acquires new ancestors.
+// See PDF 2.0, 7.7.3.4 and Table 31.
+func materializeInheritedPageAttrs(d types.Dict, attrs *InheritedPageAttrs) {
+	if _, found := d["Rotate"]; !found {
+		d["Rotate"] = types.Integer(attrs.Rotate)
+	}
+	if _, found := d["MediaBox"]; !found {
+		d["MediaBox"] = attrs.MediaBox.Array()
+	}
+	if _, found := d["CropBox"]; !found {
+		crop := attrs.CropBox
+		if crop == nil {
+			crop = attrs.MediaBox
+		}
+		d["CropBox"] = crop.Array()
+	}
+	if _, found := d["Resources"]; !found && attrs.Resources != nil {
+		d["Resources"] = attrs.Resources.Clone()
+	}
 }
 
 // Weave in ctx's pages: for each page weave in the corresponding ctx page as long as there is one.
@@ -3585,13 +3683,8 @@ func (xRefTable *XRefTable) AppendPages(c context.Context, rootPageIndRef *types
 		if err != nil {
 			return 0, err
 		}
+		materializeInheritedPageAttrs(d, inhPAttrs)
 		d["Parent"] = *indRef1
-		if _, found := d["Rotate"]; !found {
-			d["Rotate"] = types.Integer(inhPAttrs.Rotate)
-		}
-		if _, found := d["MediaBox"]; !found {
-			d["MediaBox"] = inhPAttrs.MediaBox.Array()
-		}
 		kids1 = append(kids1, *indRef2)
 	}
 	d1["Kids"] = kids1
@@ -3643,8 +3736,8 @@ func (xRefTable *XRefTable) insertContent(pageDict types.Dict, bb []byte) error 
 	return nil
 }
 
-func appendToContentStream(sd *types.StreamDict, bb []byte) error {
-	err := sd.Decode()
+func (xRefTable *XRefTable) appendToContentStream(sd *types.StreamDict, bb []byte) error {
+	err := xRefTable.DecodeStream(sd)
 	if err == filter.ErrUnsupportedFilter {
 		if log.InfoEnabled() {
 			log.Info.Println("unsupported filter: unable to patch content with watermark.")
@@ -3681,7 +3774,7 @@ func (xRefTable *XRefTable) AppendContent(pageDict types.Dict, bb []byte) error 
 	switch o := obj.(type) {
 
 	case types.StreamDict:
-		if err := appendToContentStream(&o, bb); err != nil {
+		if err := xRefTable.appendToContentStream(&o, bb); err != nil {
 			return err
 		}
 		entry.Object = o
@@ -3694,7 +3787,7 @@ func (xRefTable *XRefTable) AppendContent(pageDict types.Dict, bb []byte) error 
 		genNr := indRef.GenerationNumber.Value()
 		entry, _ = xRefTable.FindTableEntry(objNr, genNr)
 		sd, _ := (entry.Object).(types.StreamDict)
-		if err := appendToContentStream(&sd, bb); err != nil {
+		if err := xRefTable.appendToContentStream(&sd, bb); err != nil {
 			return err
 		}
 		entry.Object = sd

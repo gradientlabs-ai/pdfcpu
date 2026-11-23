@@ -14,19 +14,13 @@ By contributing to pdfcpu, you agree that your contribution is submitted under t
 
 Contributions may be used, modified, distributed, sublicensed, and otherwise handled as permitted by the Apache License, Version 2.0.
 
-## Contributor License Agreement
-
-pdfcpu uses a Contributor License Agreement process for pull requests.
-
-Before a pull request can be accepted, the contributor must complete the CLA process as requested by the CLA Assistant check on GitHub. Pull requests may not be merged until the CLA Assistant check confirms that the required agreement has been completed.
-
-By submitting a pull request and completing the CLA process, you confirm that you have the right to submit the contribution and to grant the rights described in the applicable CLA.
-
-The CLA process is used to document the inbound rights needed by the project maintainers to review, modify, distribute, sublicense, and maintain contributions as part of the Apache-2.0 licensed project.
-
 ## Developer Certificate of Origin
 
-pdfcpu may also accept `Signed-off-by` lines in commits as an additional provenance signal, but the CLA Assistant check is the authoritative contribution gate for pull requests unless the maintainers state otherwise.
+Before a pull request can be merged, the contributor must accept the [Developer Certificate of Origin 1.1](https://cla-assistant.io/pdfcpu/pdfcpu) when the CLA Assistant check on GitHub asks for it. Pull requests may not be merged until the check confirms acceptance.
+
+By accepting it, you certify that you have the right to submit the contribution under the project's license. The Developer Certificate of Origin grants no rights beyond the Apache License, Version 2.0.
+
+`Signed-off-by` lines in commits are welcome as an additional provenance signal but are not required.
 
 A sign-off line looks like this:
 
@@ -72,6 +66,7 @@ Before starting larger changes, please open an issue or discussion first. This h
 Please do not report security vulnerabilities as public GitHub issues.
 
 See the [security policy](SECURITY.md) for private reporting instructions and the coordinated disclosure process.
+Security reports follow that policy, including its rules for AI-assisted reports and multiple findings.
 
 ## Test Files and PDFs
 
@@ -111,7 +106,7 @@ Before opening a pull request:
 4. Keep the pull request focused on one topic.
 5. Include tests or a clear explanation if tests are not practical.
 6. Include a useful description of the problem and the solution.
-7. Complete the CLA Assistant process when requested.
+7. Accept the Developer Certificate of Origin when the CLA Assistant check asks for it.
 8. Do not include unrelated formatting or cleanup changes.
 
 The maintainers may ask for changes before merging. Not every contribution can be accepted.
@@ -132,13 +127,43 @@ Do not add dependencies with GPL-only, AGPL-only, proprietary, unclear, or other
 
 ## AI-Assisted Contributions
 
-AI-assisted contributions are not accepted.
-
-Please do not submit pull requests, patches, generated code, documentation, tests, or issue comments that were created substantially by AI tools.
-
 This policy is intended to keep reviews focused, reduce provenance uncertainty, and avoid additional maintainer workload.
+It distinguishes between code and reports.
 
-Contributors are expected to understand and author the contributions they submit.
+### Code
+
+Pull requests, patches, tests and documentation created substantially by AI tools are not accepted.
+
+Contributors are expected to understand and author the contributions they submit, and to be able to explain every
+change in review. Limited help from tools, for example to search, to explain existing code or to check spelling, is
+fine. If an AI tool contributed to a commit, disclose it with an `Assisted-by:` or `Co-authored-by:` trailer naming the
+tool.
+
+Do not add AI instruction or configuration files, such as `AGENTS.md`, `CLAUDE.md`, Copilot or Cursor rules, to a pull
+request.
+
+### Issues and discussions
+
+Write in your own words. AI may assist your investigation, but every report must be understood, manually verified and
+independently reproduced by its author. AI-generated, bulk-generated or mechanically reformatted reports will be closed
+without investigation.
+
+### Security reports
+
+Security reports are assessed on their merits, whether or not AI tools were used. See the [security policy](SECURITY.md).
+
+## Findings from Reviews and Fuzzing
+
+If you or your organization have many findings, for example from a security review or a fuzzing campaign:
+
+- report security-relevant findings privately as described in the [security policy](SECURITY.md), starting with a
+  short list;
+- report other problems as individual issues, one per root cause, each with a reproducer, not as a bulk filing;
+- proposed patches are welcome as input. The maintainer decides how a problem is fixed and may implement the fix
+  independently; reporters are credited, for example with a `Co-authored-by:` trailer or in a security advisory.
+  Code incorporated from a contribution requires acceptance of the Developer Certificate of Origin;
+- findings are handled in batches at the maintainer's pace. There is no guarantee that every finding is fixed, or fixed
+  by a particular date. Reporting a finding creates no entitlement.
 
 ## Maintainer Discretion
 

@@ -17,6 +17,7 @@
 package primitives
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -276,7 +277,7 @@ func (ib *ImageBox) resource() (io.ReadCloser, error) {
 		return ib.remoteResource(u)
 	}
 
-	return os.Open(ib.Src)
+	return ib.localResource()
 }
 
 func (ib *ImageBox) remoteResource(u *url.URL) (io.ReadCloser, error) {
@@ -393,6 +394,9 @@ func (ib *ImageBox) image(pageImages, images model.ImageMap, pageNr int) (int, i
 	}
 
 	imgRes, err := ib.imageResource(pageImages, images, pageNr)
+	if errors.Is(err, os.ErrPermission) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return 0, 0, "", err
+	}
 	if err != nil || imgRes == nil {
 		return 0, 0, "", nil
 	}
@@ -636,7 +640,7 @@ func (ib *ImageBox) render(p *model.Page, pageNr int, images model.ImageMap) err
 
 	missingImg := w == 0 && h == 0
 	if missingImg {
-		w = 200
+		w, h = 200, 200
 	}
 
 	rSrc := types.RectForDim(float64(w), float64(h))
