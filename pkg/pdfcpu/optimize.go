@@ -17,7 +17,6 @@ limitations under the License.
 package pdfcpu
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -35,7 +34,16 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 )
 
-func optimizeContentStreamUsage(ctx *model.Context, sd *types.StreamDict, objNr int) (*types.IndirectRef, error) {
+// keptObjectIndRef preserves the generation of the retained object (7.3.10).
+func keptObjectIndRef(ctx *model.Context, objNr int) *types.IndirectRef {
+	gen := 0
+	if e, found := ctx.FindTableEntryLight(objNr); found && e != nil && e.Generation != nil {
+		gen = *e.Generation
+	}
+	return types.NewIndirectRef(objNr, gen)
+}
+
+func optimizeContentStreamUsage(c context.Context, ctx *model.Context, sd *types.StreamDict, objNr int) (*types.IndirectRef, error) {
 	f := ctx.Optimize.ContentStreamCache
 	if len(f) == 0 {
 		f[objNr] = sd
@@ -57,10 +65,15 @@ func optimizeContentStreamUsage(ctx *model.Context, sd *types.StreamDict, objNr 
 		return nil, nil
 	}
 
-	for _, objNr := range cachedObjNrs {
-		sd1 := f[objNr]
-		if bytes.Equal(sd.Raw, sd1.Raw) {
-			ir := types.NewIndirectRef(objNr, 0)
+	for _, objNr1 := range cachedObjNrs {
+		sd1 := f[objNr1]
+		// Matching encoded bytes also need matching stream dictionaries to preserve their meaning.
+		ok, err := model.EqualObjects(c, *sd, *sd1, ctx.XRefTable, nil)
+		if err != nil {
+			return nil, fmt.Errorf("compare content stream obj#%d with obj#%d: %w", objNr, objNr1, err)
+		}
+		if ok {
+			ir := keptObjectIndRef(ctx, objNr1)
 			ctx.IncrementRefCount(ir)
 			return ir, nil
 		}
@@ -83,7 +96,7 @@ func removeEmptyContentStreams(ctx *model.Context, pageDict types.Dict, obj type
 
 		contentStreamDict, ok := entry.Object.(types.StreamDict)
 		if ok {
-			if err := contentStreamDict.Decode(); err != nil {
+			if err := ctx.DecodeStream(&contentStreamDict); err != nil {
 				return fmt.Errorf("content stream obj#%d: decode: %w", objNr, err)
 			}
 			if len(contentStreamDict.Content) == 0 {
@@ -121,7 +134,7 @@ func removeEmptyContentStreams(ctx *model.Context, pageDict types.Dict, obj type
 			return fmt.Errorf("identifyPageContent: obj#:%d page content entry is no stream dict", pageObjNumber)
 		}
 
-		if err := contentStreamDict.Decode(); err != nil {
+		if err := ctx.DecodeStream(&contentStreamDict); err != nil {
 			return fmt.Errorf("content stream obj#%d: decode: %w", objNr, err)
 		}
 		if len(contentStreamDict.Content) > 0 {
@@ -134,7 +147,7 @@ func removeEmptyContentStreams(ctx *model.Context, pageDict types.Dict, obj type
 	return nil
 }
 
-func optimizePageContent(ctx *model.Context, pageDict types.Dict, pageObjNumber int) error {
+func optimizePageContent(c context.Context, ctx *model.Context, pageDict types.Dict, pageObjNumber int) error {
 	o, found := pageDict.Find("Contents")
 	if !found {
 		return nil
@@ -165,7 +178,7 @@ func optimizePageContent(ctx *model.Context, pageDict types.Dict, pageObjNumber 
 
 		contentStreamDict, ok := entry.Object.(types.StreamDict)
 		if ok {
-			ir, err := optimizeContentStreamUsage(ctx, &contentStreamDict, objNr)
+			ir, err := optimizeContentStreamUsage(c, ctx, &contentStreamDict, objNr)
 			if err != nil {
 				return fmt.Errorf("content stream obj#%d: optimize usage: %w", objNr, err)
 			}
@@ -445,7 +458,7 @@ func optimizeFontResourcesDict(c context.Context, ctx *model.Context, rDict type
 		if originalObjNr != nil {
 			// We have identified a redundant fontDict!
 			// Update font resource dict so that rName points to the original.
-			ir := types.NewIndirectRef(*originalObjNr, 0)
+			ir := keptObjectIndRef(ctx, *originalObjNr)
 			rDict[rName] = *ir
 			ctx.IncrementRefCount(ir)
 			if log.OptimizeEnabled() {
@@ -576,7 +589,7 @@ func optimizeXObjectImage(c context.Context, ctx *model.Context, osd *types.Stre
 	if originalObjNr != nil {
 		// We have identified a redundant image!
 		// Update xobject resource dict so that rName points to the original.
-		ir := types.NewIndirectRef(*originalObjNr, 0)
+		ir := keptObjectIndRef(ctx, *originalObjNr)
 		ctx.IncrementRefCount(ir)
 		rDict[rName] = *ir
 		if log.OptimizeEnabled() {
@@ -627,7 +640,7 @@ func optimizeXObjectForm(c context.Context, ctx *model.Context, sd *types.Stream
 			return nil, fmt.Errorf("compare form XObject obj#%d with obj#%d: %w", objNr, objNr1, err)
 		}
 		if ok {
-			ir := types.NewIndirectRef(objNr1, 0)
+			ir := keptObjectIndRef(ctx, objNr1)
 			ctx.IncrementRefCount(ir)
 			return ir, nil
 		}
@@ -1086,7 +1099,7 @@ func parsePageTreeKid(c context.Context, ctx *model.Context, v types.Object, kid
 	}
 
 	if ctx.OptimizeDuplicateContentStreams {
-		if err = optimizePageContent(ctx, d, int(ir.ObjectNumber)); err != nil {
+		if err = optimizePageContent(c, ctx, d, int(ir.ObjectNumber)); err != nil {
 			return 0, fmt.Errorf("page %d obj#%d: optimize content: %w", pageNr+1, ir.ObjectNumber.Value(), err)
 		}
 	}
@@ -1276,22 +1289,18 @@ func calcRedundantObjects(c context.Context, ctx *model.Context) error {
 }
 
 func fixCorruptFontResDicts(ctx *model.Context) error {
-	// TODO: hacky, also because we don't reall y take the fontDict type into account.
+	// TODO: hacky, also because we don't really take the fontDict type into account.
 	for _, d := range ctx.Optimize.CorruptFontResDicts {
 		for k, v := range d {
 			if v == nil {
 				for fn, objNrs := range ctx.Optimize.Fonts {
-
 					if strings.HasPrefix(fn, "Arial") && (len(fn) == 5 || fn[5] != '-') {
 						model.ShowRepaired(fmt.Sprintf("font %s mapped to objNr %d", k, objNrs[0]))
-						d[k] = *types.NewIndirectRef(objNrs[0], 0)
+						d[k] = *keptObjectIndRef(ctx, objNrs[0])
 						break
 					}
 				}
 			}
-			// if d[k] == nil {
-			// 	d[k] = *types.NewIndirectRef(objNrs[0], 0)
-			// }
 		}
 	}
 	return nil
@@ -1578,143 +1587,114 @@ func calcBinarySizes(ctx *model.Context) error {
 	return nil
 }
 
-func fixDeepDict(c context.Context, ctx *model.Context, d types.Dict) error {
-	if err := contextutil.Check(c); err != nil {
-		return err
-	}
-	for k, v := range d {
-		ir, err := fixDeepObject(c, ctx, v)
-		if err != nil {
-			return fmt.Errorf("%s: %w", k, err)
-		}
-		if ir != nil {
-			d[k] = *ir
-		}
-	}
-
-	return nil
+// freeRefFix replaces references to free objects reachable from the root with references to one null object.
+// It walks the object graph with an explicit stack, so a long reference chain cannot exhaust the goroutine stack.
+type freeRefFix struct {
+	c     context.Context
+	ctx   *model.Context
+	stack objectStack
 }
 
-func fixDeepArray(c context.Context, ctx *model.Context, a types.Array) error {
-	if err := contextutil.Check(c); err != nil {
-		return err
-	}
-	for i, v := range a {
-		ir, err := fixDeepObject(c, ctx, v)
-		if err != nil {
-			return fmt.Errorf("[%d]: %w", i, err)
-		}
-		if ir != nil {
-			a[i] = *ir
-		}
-	}
-
-	return nil
-}
-
-func fixDirectObject(c context.Context, ctx *model.Context, o types.Object) error {
-	if err := contextutil.Check(c); err != nil {
-		return err
-	}
+// push schedules the entries of a dictionary or array; objNr identifies its indirect object, 0 for a direct one.
+func (f *freeRefFix) push(o types.Object, objNr int) {
 	switch o := o.(type) {
 	case types.Dict:
-		for k, v := range o {
-			ir, err := fixDeepObject(c, ctx, v)
-			if err != nil {
-				return fmt.Errorf("%s: %w", k, err)
-			}
-			if ir != nil {
-				o[k] = *ir
-			}
-		}
+		f.stack.pushDict(o, nil)
 	case types.Array:
-		for i, v := range o {
-			ir, err := fixDeepObject(c, ctx, v)
-			if err != nil {
-				return fmt.Errorf("[%d]: %w", i, err)
-			}
-			if ir != nil {
-				o[i] = *ir
-			}
-		}
+		f.stack.pushArray(o)
+	default:
+		return
 	}
-
-	return nil
+	f.stack.setOwner(objNr)
 }
 
-func fixIndirectObject(c context.Context, ctx *model.Context, ir *types.IndirectRef) error {
-	if err := contextutil.Check(c); err != nil {
-		return err
-	}
-	objNr := int(ir.ObjectNumber)
-
-	if ctx.Optimize.Cache[objNr] {
-		return nil
-	}
-	ctx.Optimize.Cache[objNr] = true
-
-	entry, found := ctx.Find(objNr)
-	if !found {
-		return nil
-	}
-
-	if entry.Free {
-		// This is a reference to a free object that needs to be fixed.
-
-		//fmt.Printf("fixNullObject: #%d g%d\n", objNr, genNr)
-
-		if ctx.Optimize.NullObjNr == nil {
-			nr, err := ctx.InsertObject(nil)
-			if err != nil {
-				return fmt.Errorf("insert null object for free obj#%d: %w", objNr, err)
-			}
-			ctx.Optimize.NullObjNr = &nr
+func (f *freeRefFix) nullObjNr(objNr int) (int, error) {
+	if f.ctx.Optimize.NullObjNr == nil {
+		nr, err := f.ctx.InsertObject(nil)
+		if err != nil {
+			return 0, fmt.Errorf("insert null object for free obj#%d: %w", objNr, err)
 		}
-
-		ir.ObjectNumber = types.Integer(*ctx.Optimize.NullObjNr)
-
-		return nil
+		f.ctx.Optimize.NullObjNr = &nr
 	}
-
-	var err error
-
-	switch o := entry.Object.(type) {
-
-	case types.Dict:
-		err = fixDeepDict(c, ctx, o)
-
-	case types.StreamDict:
-		err = fixDeepDict(c, ctx, o.Dict)
-
-	case types.Array:
-		err = fixDeepArray(c, ctx, o)
-
-	}
-
-	if err != nil {
-		return fmt.Errorf("obj#%d: %w", objNr, err)
-	}
-	return nil
+	return *f.ctx.Optimize.NullObjNr, nil
 }
 
-func fixDeepObject(c context.Context, ctx *model.Context, o types.Object) (*types.IndirectRef, error) {
-	if err := contextutil.Check(c); err != nil {
-		return nil, err
-	}
+// fixValue repairs a reference to a free object and schedules the entries of the object a reference resolves to.
+func (f *freeRefFix) fixValue(o types.Object) (types.Object, error) {
 	ir, ok := o.(types.IndirectRef)
 	if !ok {
-		return nil, fixDirectObject(c, ctx, o)
+		f.push(o, 0)
+		return o, nil
 	}
+	objNr := int(ir.ObjectNumber)
+	if f.ctx.Optimize.Cache[objNr] {
+		return o, nil
+	}
+	f.ctx.Optimize.Cache[objNr] = true
 
-	err := fixIndirectObject(c, ctx, &ir)
-	return &ir, err
+	entry, found := f.ctx.Find(objNr)
+	if !found {
+		return o, nil
+	}
+	if entry.Free {
+		// This is a reference to a free object that needs to be fixed.
+		nr, err := f.nullObjNr(objNr)
+		if err != nil {
+			return nil, err
+		}
+		ir.ObjectNumber = types.Integer(nr)
+		return ir, nil
+	}
+	if sd, ok := entry.Object.(types.StreamDict); ok {
+		f.push(sd.Dict, objNr)
+		return o, nil
+	}
+	f.push(entry.Object, objNr)
+	return o, nil
+}
+
+// label names the entry last returned for frame j, preceded by the indirect object the frame iterates.
+func (f *freeRefFix) label(j int) string {
+	key, index, isDict := f.stack.position(j)
+	if !isDict {
+		key = fmt.Sprintf("[%d]", index)
+	}
+	if objNr := f.stack.owner(j); objNr > 0 {
+		return fmt.Sprintf("obj#%d: %s", objNr, key)
+	}
+	return key
+}
+
+// wrap prefixes err with the path from the root to the entry of frame i that failed.
+func (f *freeRefFix) wrap(i int, err error) error {
+	return fmt.Errorf("%s: %w", errorPath(i+1, f.label), err)
+}
+
+func (f *freeRefFix) run() error {
+	for !f.stack.empty() {
+		if err := contextutil.Check(f.c); err != nil {
+			return err
+		}
+		i, o, ok := f.stack.next()
+		if !ok {
+			continue
+		}
+		o, err := f.fixValue(o)
+		if err != nil {
+			return f.wrap(i, err)
+		}
+		f.stack.replace(i, o)
+	}
+	return nil
 }
 
 func fixReferencesToFreeObjects(c context.Context, ctx *model.Context) error {
 	if err := contextutil.Check(c); err != nil {
 		return err
 	}
-	if err := fixDirectObject(c, ctx, ctx.RootDict); err != nil {
+	f := freeRefFix{c: c, ctx: ctx}
+	f.push(ctx.RootDict, 0)
+	if err := f.run(); err != nil {
 		return fmt.Errorf("root dict: %w", err)
 	}
 	return nil
