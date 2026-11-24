@@ -1697,8 +1697,69 @@ func TestParseObjectPlaintextRC4StringsInInfoDict(t *testing.T) {
 
 	t.Run("relaxed other dict", func(t *testing.T) {
 		d := parse(t, model.ValidationRelaxed, 45)
-		if got := d["ModDate"]; got == types.StringLiteral("D:20261123105941Z") {
-			t.Fatalf("a dict other than Info kept the plaintext ModDate")
+		for k, want := range map[string]types.Object{
+			"ModDate": types.StringLiteral("D:20261123105941Z"),
+			"Title":   types.StringLiteral("Plum ISA Transfer Authority"),
+			"Author":  types.StringLiteral("Real Author"),
+		} {
+			if got := d[k]; got != want {
+				t.Errorf("%s: got %v, want %v", k, got, want)
+			}
+		}
+	})
+}
+
+func TestParseObjectPlaintextRC4StringsInFontAndLinkDicts(t *testing.T) {
+	key := bytes.Repeat([]byte{3}, 16)
+	encrypted, err := encryptStringLiteral(types.StringLiteral("Real text"), 44, 0, key, false, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj := "44 0 obj\n<<\n/Type /Font\n/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>\n" +
+		"/A << /S /URI /URI (mailto:isatransfer@example.com) >>\n/Encrypted " + encrypted.PDFString() + "\n>>\nendobj\n"
+
+	parse := func(t *testing.T, mode int) types.Dict {
+		t.Helper()
+		ctx := &model.Context{
+			Read: &model.ReadContext{RS: bytes.NewReader([]byte(obj))},
+			XRefTable: &model.XRefTable{
+				E:              &model.Enc{R: 3, V: 2},
+				EncKey:         key,
+				ValidationMode: mode,
+			},
+		}
+		o, err := ParseObject(t.Context(), ctx, 0, 44, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, ok := o.(types.Dict)
+		if !ok {
+			t.Fatalf("expected Dict, got %T", o)
+		}
+		return d
+	}
+
+	t.Run("relaxed", func(t *testing.T) {
+		d := parse(t, model.ValidationRelaxed)
+		cidSystemInfo := d["CIDSystemInfo"].(types.Dict)
+		if got := cidSystemInfo["Registry"]; got != types.StringLiteral("Adobe") {
+			t.Errorf("Registry: got %v, want Adobe", got)
+		}
+		if got := cidSystemInfo["Ordering"]; got != types.StringLiteral("Identity") {
+			t.Errorf("Ordering: got %v, want Identity", got)
+		}
+		if got := d["A"].(types.Dict)["URI"]; got != types.StringLiteral("mailto:isatransfer@example.com") {
+			t.Errorf("URI: got %v, want the plaintext mailto link", got)
+		}
+		if got := d["Encrypted"]; got != types.StringLiteral("Real text") {
+			t.Errorf("Encrypted: got %v, want Real text", got)
+		}
+	})
+
+	t.Run("strict", func(t *testing.T) {
+		d := parse(t, model.ValidationStrict)
+		if got := d["CIDSystemInfo"].(types.Dict)["Registry"]; got == types.StringLiteral("Adobe") {
+			t.Fatalf("strict mode kept the plaintext Registry")
 		}
 	})
 }
