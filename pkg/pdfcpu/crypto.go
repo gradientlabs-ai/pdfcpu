@@ -2203,6 +2203,29 @@ func plaintextRC4String(needAES, relaxed bool, key string, raw, decrypted types.
 	return ok && !printableASCII(decryptedBytes)
 }
 
+func percentEncodeNonASCII(uri types.Object) (types.Object, bool, error) {
+	uriBytes, ok := literalBytes(uri)
+	if !ok || !slices.ContainsFunc(uriBytes, func(c byte) bool { return c >= 0x80 }) {
+		return uri, false, nil
+	}
+	encodedBytes := make([]byte, 0, len(uriBytes))
+	for _, c := range uriBytes {
+		if c >= 0x80 {
+			encodedBytes = fmt.Appendf(encodedBytes, "%%%02X", c)
+			continue
+		}
+		encodedBytes = append(encodedBytes, c)
+	}
+	if _, isHex := uri.(types.HexLiteral); isHex {
+		return types.NewHexLiteral(encodedBytes), true, nil
+	}
+	escaped, err := types.Escape(string(encodedBytes))
+	if err != nil {
+		return nil, false, err
+	}
+	return types.StringLiteral(*escaped), true, nil
+}
+
 func printableASCII(b []byte) bool {
 	for _, c := range b {
 		if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || c > 0x7E {
@@ -2374,6 +2397,16 @@ func decryptDict(c context.Context, d types.Dict, objNr, genNr int, key []byte, 
 		if plaintextRC4String(needAES, relaxed, k, d[k], s) {
 			model.ShowRepaired(fmt.Sprintf("plaintext RC4 string %s obj#%d", k, objNr))
 			continue
+		}
+		if relaxed && k == "URI" {
+			uri, encoded, err := percentEncodeNonASCII(s)
+			if err != nil {
+				return fmt.Errorf("percent-encode URI: %w", err)
+			}
+			if encoded {
+				model.ShowRepaired(fmt.Sprintf("non-ASCII URI obj#%d", objNr))
+				s = uri
+			}
 		}
 		d[k] = s
 	}

@@ -27,6 +27,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1786,6 +1787,70 @@ func TestParseObjectPlaintextRC4StringsInFontAndLinkDicts(t *testing.T) {
 		d := parse(t, model.ValidationStrict)
 		if got := d["CIDSystemInfo"].(types.Dict)["Registry"]; got == types.StringLiteral("Adobe") {
 			t.Fatalf("strict mode kept the plaintext Registry")
+		}
+	})
+}
+
+func TestParseObjectNonASCIIURIInRC4File(t *testing.T) {
+	key := bytes.Repeat([]byte{3}, 16)
+	latin1URI, err := encryptStringLiteral(types.StringLiteral("mailto:jos\xe9@example.com"), 44, 0, key, false, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	utf8URI, err := encryptHexLiteral(types.NewHexLiteral([]byte("mailto:jos\xc3\xa9@example.com")), 44, 0, key, false, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj := "44 0 obj\n<<\n/Latin1 << /S /URI /URI " + latin1URI.PDFString() + " >>\n" +
+		"/UTF8 << /S /URI /URI " + utf8URI.PDFString() + " >>\n" +
+		"/PlaintextLatin1 << /S /URI /URI (mailto:jos\xe9@example.com) >>\n>>\nendobj\n"
+
+	parse := func(t *testing.T, mode int) types.Dict {
+		t.Helper()
+		ctx := &model.Context{
+			Read: &model.ReadContext{RS: bytes.NewReader([]byte(obj))},
+			XRefTable: &model.XRefTable{
+				E:              &model.Enc{R: 3, V: 2},
+				EncKey:         key,
+				ValidationMode: mode,
+			},
+		}
+		o, err := ParseObject(t.Context(), ctx, 0, 44, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, ok := o.(types.Dict)
+		if !ok {
+			t.Fatalf("expected Dict, got %T", o)
+		}
+		return d
+	}
+	uriBytes := func(t *testing.T, d types.Dict, action string) []byte {
+		t.Helper()
+		b, ok := literalBytes(d[action].(types.Dict)["URI"])
+		if !ok {
+			t.Fatalf("%s: URI is %T", action, d[action].(types.Dict)["URI"])
+		}
+		return b
+	}
+
+	t.Run("relaxed", func(t *testing.T) {
+		d := parse(t, model.ValidationRelaxed)
+		if got := string(uriBytes(t, d, "Latin1")); got != "mailto:jos%E9@example.com" {
+			t.Errorf("Latin1: got %q, want mailto:jos%%E9@example.com", got)
+		}
+		if got := string(uriBytes(t, d, "UTF8")); got != "mailto:jos%C3%A9@example.com" {
+			t.Errorf("UTF8: got %q, want mailto:jos%%C3%%A9@example.com", got)
+		}
+		if got := uriBytes(t, d, "PlaintextLatin1"); slices.ContainsFunc(got, func(c byte) bool { return c >= 0x80 }) {
+			t.Errorf("PlaintextLatin1: got non-ASCII bytes %x", got)
+		}
+	})
+
+	t.Run("strict", func(t *testing.T) {
+		d := parse(t, model.ValidationStrict)
+		if got := string(uriBytes(t, d, "Latin1")); got != "mailto:jos\xe9@example.com" {
+			t.Errorf("Latin1: got %q, want the decrypted bytes unchanged", got)
 		}
 	})
 }
