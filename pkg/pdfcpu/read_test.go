@@ -1697,14 +1697,14 @@ func TestParseObjectPlaintextRC4StringsInInfoDict(t *testing.T) {
 
 	t.Run("relaxed other dict", func(t *testing.T) {
 		d := parse(t, model.ValidationRelaxed, 45)
-		for k, want := range map[string]types.Object{
-			"ModDate": types.StringLiteral("D:20261123105941Z"),
-			"Title":   types.StringLiteral("Plum ISA Transfer Authority"),
-			"Author":  types.StringLiteral("Real Author"),
-		} {
-			if got := d[k]; got != want {
-				t.Errorf("%s: got %v, want %v", k, got, want)
-			}
+		if got := d["ModDate"]; got == types.StringLiteral("D:20261123105941Z") {
+			t.Errorf("a dict other than Info kept the plaintext ModDate")
+		}
+		if got := d["Title"]; got == types.StringLiteral("Plum ISA Transfer Authority") {
+			t.Errorf("a dict other than Info kept the plaintext Title")
+		}
+		if got := d["Author"]; got != types.StringLiteral("Real Author") {
+			t.Errorf("Author: got %v, want Real Author", got)
 		}
 	})
 }
@@ -1715,8 +1715,24 @@ func TestParseObjectPlaintextRC4StringsInFontAndLinkDicts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	lookup := []byte("AAA")
+	var palette []byte
+	for c := byte('A'); c <= 'Z'; c++ {
+		lookup[2] = c
+		palette, err = decryptBytes(bytes.Clone(lookup), 44, 0, key, false, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !printableASCII(palette) {
+			break
+		}
+	}
+	if printableASCII(palette) {
+		t.Fatal("no printable lookup ciphertext decrypts to a non-ASCII palette")
+	}
 	obj := "44 0 obj\n<<\n/Type /Font\n/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>\n" +
-		"/A << /S /URI /URI (mailto:isatransfer@example.com) >>\n/Encrypted " + encrypted.PDFString() + "\n>>\nendobj\n"
+		"/A << /S /URI /URI (mailto:isatransfer@example.com) >>\n/Encrypted " + encrypted.PDFString() + "\n" +
+		"/Title (Plain title)\n/ColorSpace [/Indexed /DeviceRGB 0 " + types.NewHexLiteral(lookup).PDFString() + "]\n>>\nendobj\n"
 
 	parse := func(t *testing.T, mode int) types.Dict {
 		t.Helper()
@@ -1753,6 +1769,16 @@ func TestParseObjectPlaintextRC4StringsInFontAndLinkDicts(t *testing.T) {
 		}
 		if got := d["Encrypted"]; got != types.StringLiteral("Real text") {
 			t.Errorf("Encrypted: got %v, want Real text", got)
+		}
+		if got := d["Title"]; got == types.StringLiteral("Plain title") {
+			t.Errorf("Title: kept the plaintext value of a key outside the ASCII string keys")
+		}
+		gotLookup, err := d["ColorSpace"].(types.Array)[3].(types.HexLiteral).Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotLookup, palette) {
+			t.Errorf("Indexed lookup: got %x, want %x", gotLookup, palette)
 		}
 	})
 
