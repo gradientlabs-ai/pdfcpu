@@ -27,6 +27,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1697,14 +1698,14 @@ func TestParseObjectPlaintextRC4StringsInInfoDict(t *testing.T) {
 
 	t.Run("relaxed other dict", func(t *testing.T) {
 		d := parse(t, model.ValidationRelaxed, 45)
-		for k, want := range map[string]types.Object{
-			"ModDate": types.StringLiteral("D:20261123105941Z"),
-			"Title":   types.StringLiteral("Plum ISA Transfer Authority"),
-			"Author":  types.StringLiteral("Real Author"),
-		} {
-			if got := d[k]; got != want {
-				t.Errorf("%s: got %v, want %v", k, got, want)
-			}
+		if got := d["ModDate"]; got == types.StringLiteral("D:20261123105941Z") {
+			t.Errorf("a dict other than Info kept the plaintext ModDate")
+		}
+		if got := d["Title"]; got == types.StringLiteral("Plum ISA Transfer Authority") {
+			t.Errorf("a dict other than Info kept the plaintext Title")
+		}
+		if got := d["Author"]; got != types.StringLiteral("Real Author") {
+			t.Errorf("Author: got %v, want Real Author", got)
 		}
 	})
 }
@@ -1715,8 +1716,24 @@ func TestParseObjectPlaintextRC4StringsInFontAndLinkDicts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	lookup := []byte("AAA")
+	var palette []byte
+	for c := byte('A'); c <= 'Z'; c++ {
+		lookup[2] = c
+		palette, err = decryptBytes(bytes.Clone(lookup), 44, 0, key, false, 3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !printableASCII(palette) {
+			break
+		}
+	}
+	if printableASCII(palette) {
+		t.Fatal("no printable lookup ciphertext decrypts to a non-ASCII palette")
+	}
 	obj := "44 0 obj\n<<\n/Type /Font\n/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >>\n" +
-		"/A << /S /URI /URI (mailto:isatransfer@example.com) >>\n/Encrypted " + encrypted.PDFString() + "\n>>\nendobj\n"
+		"/A << /S /URI /URI (mailto:isatransfer@example.com) >>\n/Encrypted " + encrypted.PDFString() + "\n" +
+		"/Title (Plain title)\n/ColorSpace [/Indexed /DeviceRGB 0 " + types.NewHexLiteral(lookup).PDFString() + "]\n>>\nendobj\n"
 
 	parse := func(t *testing.T, mode int) types.Dict {
 		t.Helper()
@@ -1754,12 +1771,86 @@ func TestParseObjectPlaintextRC4StringsInFontAndLinkDicts(t *testing.T) {
 		if got := d["Encrypted"]; got != types.StringLiteral("Real text") {
 			t.Errorf("Encrypted: got %v, want Real text", got)
 		}
+		if got := d["Title"]; got == types.StringLiteral("Plain title") {
+			t.Errorf("Title: kept the plaintext value of a key outside the ASCII string keys")
+		}
+		gotLookup, err := d["ColorSpace"].(types.Array)[3].(types.HexLiteral).Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotLookup, palette) {
+			t.Errorf("Indexed lookup: got %x, want %x", gotLookup, palette)
+		}
 	})
 
 	t.Run("strict", func(t *testing.T) {
 		d := parse(t, model.ValidationStrict)
 		if got := d["CIDSystemInfo"].(types.Dict)["Registry"]; got == types.StringLiteral("Adobe") {
 			t.Fatalf("strict mode kept the plaintext Registry")
+		}
+	})
+}
+
+func TestParseObjectNonASCIIURIInRC4File(t *testing.T) {
+	key := bytes.Repeat([]byte{3}, 16)
+	latin1URI, err := encryptStringLiteral(types.StringLiteral("mailto:jos\xe9@example.com"), 44, 0, key, false, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	utf8URI, err := encryptHexLiteral(types.NewHexLiteral([]byte("mailto:jos\xc3\xa9@example.com")), 44, 0, key, false, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj := "44 0 obj\n<<\n/Latin1 << /S /URI /URI " + latin1URI.PDFString() + " >>\n" +
+		"/UTF8 << /S /URI /URI " + utf8URI.PDFString() + " >>\n" +
+		"/PlaintextLatin1 << /S /URI /URI (mailto:jos\xe9@example.com) >>\n>>\nendobj\n"
+
+	parse := func(t *testing.T, mode int) types.Dict {
+		t.Helper()
+		ctx := &model.Context{
+			Read: &model.ReadContext{RS: bytes.NewReader([]byte(obj))},
+			XRefTable: &model.XRefTable{
+				E:              &model.Enc{R: 3, V: 2},
+				EncKey:         key,
+				ValidationMode: mode,
+			},
+		}
+		o, err := ParseObject(t.Context(), ctx, 0, 44, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, ok := o.(types.Dict)
+		if !ok {
+			t.Fatalf("expected Dict, got %T", o)
+		}
+		return d
+	}
+	uriBytes := func(t *testing.T, d types.Dict, action string) []byte {
+		t.Helper()
+		b, ok := literalBytes(d[action].(types.Dict)["URI"])
+		if !ok {
+			t.Fatalf("%s: URI is %T", action, d[action].(types.Dict)["URI"])
+		}
+		return b
+	}
+
+	t.Run("relaxed", func(t *testing.T) {
+		d := parse(t, model.ValidationRelaxed)
+		if got := string(uriBytes(t, d, "Latin1")); got != "mailto:jos%E9@example.com" {
+			t.Errorf("Latin1: got %q, want mailto:jos%%E9@example.com", got)
+		}
+		if got := string(uriBytes(t, d, "UTF8")); got != "mailto:jos%C3%A9@example.com" {
+			t.Errorf("UTF8: got %q, want mailto:jos%%C3%%A9@example.com", got)
+		}
+		if got := uriBytes(t, d, "PlaintextLatin1"); slices.ContainsFunc(got, func(c byte) bool { return c >= 0x80 }) {
+			t.Errorf("PlaintextLatin1: got non-ASCII bytes %x", got)
+		}
+	})
+
+	t.Run("strict", func(t *testing.T) {
+		d := parse(t, model.ValidationStrict)
+		if got := string(uriBytes(t, d, "Latin1")); got != "mailto:jos\xe9@example.com" {
+			t.Errorf("Latin1: got %q, want the decrypted bytes unchanged", got)
 		}
 	})
 }

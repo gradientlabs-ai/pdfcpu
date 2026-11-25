@@ -1893,11 +1893,11 @@ func infoDictStrings(obj types.Object) map[string]types.Object {
 // only when it reads as a date or text and the decrypted value does not.
 func keepPlaintextInfoStrings(d types.Dict, raw map[string]types.Object, objNr int) {
 	for k, rawValue := range raw {
-		rawBytes, ok := infoStringBytes(rawValue)
+		rawBytes, ok := literalBytes(rawValue)
 		if !ok || !plausibleInfoString(k, rawBytes) {
 			continue
 		}
-		decryptedBytes, ok := infoStringBytes(d[k])
+		decryptedBytes, ok := literalBytes(d[k])
 		if ok && plausibleInfoString(k, decryptedBytes) {
 			continue
 		}
@@ -1906,7 +1906,7 @@ func keepPlaintextInfoStrings(d types.Dict, raw map[string]types.Object, objNr i
 	}
 }
 
-func infoStringBytes(o types.Object) ([]byte, bool) {
+func literalBytes(o types.Object) ([]byte, bool) {
 	switch v := o.(type) {
 	case types.StringLiteral:
 		b, err := types.Unescape(v.Value())
@@ -2181,11 +2181,49 @@ func repairablePlaintextString(needAES, relaxed bool, err error) bool {
 	return errors.Is(err, errAESCiphertextTooShort) || errors.Is(err, errAESCiphertextUnaligned)
 }
 
+var asciiStringKeys = map[string]bool{
+	"Ordering": true,
+	"Registry": true,
+	"URI":      true,
+}
+
 // plaintextRC4String reports whether a string in an RC4-encrypted file was written unencrypted.
-// RC4 decryption never fails, so it turns such a string into garbage of the same length. A raw
-// value that is printable ASCII while its decrypted value is not is taken as plaintext.
-func plaintextRC4String(needAES, relaxed bool, raw, decrypted []byte) bool {
-	return relaxed && !needAES && printableASCII(raw) && !printableASCII(decrypted)
+// RC4 decryption never fails, so it turns such a string into garbage of the same length. Only keys
+// whose values the spec defines as ASCII strings are checked: a raw value that is printable ASCII
+// while its decrypted value is not is taken as plaintext.
+func plaintextRC4String(needAES, relaxed bool, key string, raw, decrypted types.Object) bool {
+	if !relaxed || needAES || !asciiStringKeys[key] {
+		return false
+	}
+	rawBytes, ok := literalBytes(raw)
+	if !ok || !printableASCII(rawBytes) {
+		return false
+	}
+	decryptedBytes, ok := literalBytes(decrypted)
+	return ok && !printableASCII(decryptedBytes)
+}
+
+func percentEncodeNonASCII(uri types.Object) (types.Object, bool, error) {
+	uriBytes, ok := literalBytes(uri)
+	if !ok || !slices.ContainsFunc(uriBytes, func(c byte) bool { return c >= 0x80 }) {
+		return uri, false, nil
+	}
+	encodedBytes := make([]byte, 0, len(uriBytes))
+	for _, c := range uriBytes {
+		if c >= 0x80 {
+			encodedBytes = fmt.Appendf(encodedBytes, "%%%02X", c)
+			continue
+		}
+		encodedBytes = append(encodedBytes, c)
+	}
+	if _, isHex := uri.(types.HexLiteral); isHex {
+		return types.NewHexLiteral(encodedBytes), true, nil
+	}
+	escaped, err := types.Escape(string(encodedBytes))
+	if err != nil {
+		return nil, false, err
+	}
+	return types.StringLiteral(*escaped), true, nil
 }
 
 func printableASCII(b []byte) bool {
@@ -2206,7 +2244,6 @@ func decryptStringLiteral(sl types.StringLiteral, objNr, genNr int, key []byte, 
 	if err != nil {
 		return nil, err
 	}
-	raw := bytes.Clone(bb)
 
 	bb, err = decryptBytes(bb, objNr, genNr, key, needAES, r)
 	if err != nil {
@@ -2215,10 +2252,6 @@ func decryptStringLiteral(sl types.StringLiteral, objNr, genNr int, key []byte, 
 			return &sl, nil
 		}
 		return nil, err
-	}
-	if plaintextRC4String(needAES, relaxed, raw, bb) {
-		model.ShowRepaired(fmt.Sprintf("plaintext RC4 string obj#%d", objNr))
-		return &sl, nil
 	}
 
 	s, err := types.Escape(string(bb))
@@ -2256,7 +2289,6 @@ func decryptHexLiteral(hl types.HexLiteral, objNr, genNr int, key []byte, needAE
 	if err != nil {
 		return nil, err
 	}
-	raw := bytes.Clone(bb)
 
 	bb, err = decryptBytes(bb, objNr, genNr, key, needAES, r)
 	if err != nil {
@@ -2265,10 +2297,6 @@ func decryptHexLiteral(hl types.HexLiteral, objNr, genNr int, key []byte, needAE
 			return &hl, nil
 		}
 		return nil, err
-	}
-	if plaintextRC4String(needAES, relaxed, raw, bb) {
-		model.ShowRepaired(fmt.Sprintf("plaintext RC4 hex string obj#%d", objNr))
-		return &hl, nil
 	}
 
 	hl = types.NewHexLiteral(bb)
@@ -2363,9 +2391,24 @@ func decryptDict(c context.Context, d types.Dict, objNr, genNr int, key []byte, 
 		if err != nil {
 			return fmt.Errorf("decrypt dict entry %s: %w", k, err)
 		}
-		if s != nil {
-			d[k] = s
+		if s == nil {
+			continue
 		}
+		if plaintextRC4String(needAES, relaxed, k, d[k], s) {
+			model.ShowRepaired(fmt.Sprintf("plaintext RC4 string %s obj#%d", k, objNr))
+			continue
+		}
+		if relaxed && k == "URI" {
+			uri, encoded, err := percentEncodeNonASCII(s)
+			if err != nil {
+				return fmt.Errorf("percent-encode URI: %w", err)
+			}
+			if encoded {
+				model.ShowRepaired(fmt.Sprintf("non-ASCII URI obj#%d", objNr))
+				s = uri
+			}
+		}
+		d[k] = s
 	}
 
 	return nil
