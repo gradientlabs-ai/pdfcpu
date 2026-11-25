@@ -2181,6 +2181,22 @@ func repairablePlaintextString(needAES, relaxed bool, err error) bool {
 	return errors.Is(err, errAESCiphertextTooShort) || errors.Is(err, errAESCiphertextUnaligned)
 }
 
+// plaintextRC4String reports whether a string in an RC4-encrypted file was written unencrypted.
+// RC4 decryption never fails, so it turns such a string into garbage of the same length. A raw
+// value that is printable ASCII while its decrypted value is not is taken as plaintext.
+func plaintextRC4String(needAES, relaxed bool, raw, decrypted []byte) bool {
+	return relaxed && !needAES && printableASCII(raw) && !printableASCII(decrypted)
+}
+
+func printableASCII(b []byte) bool {
+	for _, c := range b {
+		if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') || c > 0x7E {
+			return false
+		}
+	}
+	return true
+}
+
 func decryptStringLiteral(sl types.StringLiteral, objNr, genNr int, key []byte, needAES bool, r int, relaxed bool) (*types.StringLiteral, error) {
 	if sl.Value() == "" {
 		return &sl, nil
@@ -2190,6 +2206,7 @@ func decryptStringLiteral(sl types.StringLiteral, objNr, genNr int, key []byte, 
 	if err != nil {
 		return nil, err
 	}
+	raw := bytes.Clone(bb)
 
 	bb, err = decryptBytes(bb, objNr, genNr, key, needAES, r)
 	if err != nil {
@@ -2198,6 +2215,10 @@ func decryptStringLiteral(sl types.StringLiteral, objNr, genNr int, key []byte, 
 			return &sl, nil
 		}
 		return nil, err
+	}
+	if plaintextRC4String(needAES, relaxed, raw, bb) {
+		model.ShowRepaired(fmt.Sprintf("plaintext RC4 string obj#%d", objNr))
+		return &sl, nil
 	}
 
 	s, err := types.Escape(string(bb))
@@ -2235,6 +2256,7 @@ func decryptHexLiteral(hl types.HexLiteral, objNr, genNr int, key []byte, needAE
 	if err != nil {
 		return nil, err
 	}
+	raw := bytes.Clone(bb)
 
 	bb, err = decryptBytes(bb, objNr, genNr, key, needAES, r)
 	if err != nil {
@@ -2243,6 +2265,10 @@ func decryptHexLiteral(hl types.HexLiteral, objNr, genNr int, key []byte, needAE
 			return &hl, nil
 		}
 		return nil, err
+	}
+	if plaintextRC4String(needAES, relaxed, raw, bb) {
+		model.ShowRepaired(fmt.Sprintf("plaintext RC4 hex string obj#%d", objNr))
+		return &hl, nil
 	}
 
 	hl = types.NewHexLiteral(bb)
